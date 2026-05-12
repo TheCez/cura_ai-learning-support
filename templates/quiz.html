@@ -12,6 +12,9 @@
       <div class="loading-dots"><span></span><span></span><span></span></div>
       <p>KI generiert personalisierte Fragen für dich …</p>
     </div>
+    <div class="actions-row">
+      <a class="button button-secondary" href="{{ cancel_url }}">{{ cancel_label }}</a>
+    </div>
   </div>
 
   <!-- Quiz form (hidden until questions load) -->
@@ -28,6 +31,7 @@
     <form id="quiz-form">
       <div id="questions-container"></div>
       <div class="form-actions">
+        <a class="button button-secondary" href="{{ cancel_url }}">{{ cancel_label }}</a>
         <button class="button" type="submit" id="quiz-submit-btn">Quiz auswerten</button>
       </div>
     </form>
@@ -41,6 +45,8 @@
 <script>
 const moduleId = {{ module.id }};
 const courseId = {{ course_id }};
+const cancelUrl = {{ cancel_url | tojson }};
+const cancelLabel = {{ cancel_label | tojson }};
 let quizQuestions = [];
 
 // ── Load questions on page load ────────────────
@@ -101,7 +107,8 @@ document.getElementById('quiz-form').addEventListener('submit', function (e) {
   document.getElementById('quiz-content').classList.add('hidden');
   document.getElementById('quiz-loading').innerHTML =
     '<div class="ki-loading"><div class="loading-dots"><span></span><span></span><span></span></div>' +
-    '<p>KI bewertet deine Antworten …</p></div>';
+    '<p>KI bewertet deine Antworten …</p></div>' +
+    `<div class="actions-row"><a class="button button-secondary" href="${escAttr(cancelUrl)}">${escHtml(cancelLabel)}</a></div>`;
   document.getElementById('quiz-loading').classList.remove('hidden');
 
   fetch('/api/quiz/submit', {
@@ -172,6 +179,7 @@ function renderResults(data) {
        </div>
      </div>
      <div class="actions-row">
+       <a class="button button-secondary" href="${escAttr(cancelUrl)}">${escHtml(cancelLabel)}</a>
        <a class="button" href="/courses/${courseId}/module/${moduleId}">Modul erneut ansehen</a>
        <a class="button button-secondary" href="/student">Zum Dashboard</a>
      </div>`;

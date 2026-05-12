@@ -1,5 +1,6 @@
 import os
 import json as _json
+import re
 from models import db, User, Course, Module
 
 genai = None
@@ -392,7 +393,8 @@ def build_ki_lehrer_system_prompt(first_name: str, language_level: str,
                                    module_content: str,
                                    today_module_title: str = '',
                                    today_course_title: str = '',
-                                   student_context: str = '') -> str:
+                                   student_context: str = '',
+                                   is_mixed: bool = False) -> str:
     level_desc = {
         'A1': 'sehr einfaches Deutsch, Sätze max. 8 Wörter, nur Grundvokabular – jeden Fachbegriff sofort erklären',
         'A2': 'einfaches Deutsch mit Alltagsausdrücken, kurze klare Sätze',
@@ -403,18 +405,25 @@ def build_ki_lehrer_system_prompt(first_name: str, language_level: str,
 
     module_section = ''
     if module_content:
+        header = ('## Inhalte aller Module (Grundlage für gemischte Themen)'
+                  if is_mixed else
+                  '## Modulinhalt (Pflichtbasis deiner Erklärungen)')
+        intro = ('Diese Inhalte darfst du frei kombinieren, vergleichen und querverweisen:'
+                 if is_mixed else
+                 'Deine Erklärungen MÜSSEN sich auf diesen offiziellen Inhalt beziehen:')
+        limit = 4000 if is_mixed else 2000
         module_section = f"""
 
-## Modulinhalt (Pflichtbasis deiner Erklärungen)
-Deine Erklärungen MÜSSEN sich auf diesen offiziellen Inhalt beziehen:
+{header}
+{intro}
 
 ---
-{module_content[:2000]}
+{module_content[:limit]}
 ---
 """
 
     today_section = ''
-    if today_module_title:
+    if today_module_title and not is_mixed:
         t_course = today_course_title or course_title
         today_section = (
             f'\n\n## Heutiges Thema (vom Lehrer festgelegt)\n'
@@ -423,15 +432,36 @@ Deine Erklärungen MÜSSEN sich auf diesen offiziellen Inhalt beziehen:
             'Schueler duerfen aber auch nach frueheren Inhalten fragen.'
         )
 
-    greeting_rule = (
-        'BEGRUESSING (nur bei __GREETING__): Sage NUR: '
-        f'"Hallo {first_name}! Hier ist Prof. Wagner." '
-        '- danach sofort den ersten Kernpunkt des Moduls erlaeutern. '
-        'Keine langen Einleitungen.'
-    )
+    if is_mixed:
+        greeting_rule = (
+            'BEGRUESSING (nur bei __GREETING__): Sage NUR: '
+            f'"Hallo {first_name}! Heute machen wir Gemischte Themen." '
+            '- danach sofort eine kurze Frage stellen, welches Thema interessiert '
+            '(z.B. "Womit möchtest du starten - Blutdruck, Hygiene oder Kommunikation?"). '
+            'Keine langen Einleitungen.'
+        )
+    else:
+        greeting_rule = (
+            'BEGRUESSING (nur bei __GREETING__): Sage NUR: '
+            f'"Hallo {first_name}! Hier ist Prof. Wagner." '
+            '- danach sofort den ersten Kernpunkt des Moduls erlaeutern. '
+            'Keine langen Einleitungen.'
+        )
+
+    if is_mixed:
+        role_line = (f'Du unterrichtest {first_name} heute im Modus „Gemischte Themen" – '
+                     'du darfst Themen aus allen Modulen der Pflegeausbildung frei kombinieren '
+                     'und auf Nachfragen über beliebige Themen eingehen.')
+        mixed_greeting_hint = ' + kurze Themenfrage'
+        offtopic_rule = ('Themenwechsel innerhalb der Pflegeausbildung sind willkommen – '
+                         'lasse den Schüler wählen und folge seinen Fragen flexibel')
+    else:
+        role_line = f'Du unterrichtest {first_name} im Modul „{module_title}" (Kurs: {course_title}).'
+        mixed_greeting_hint = ''
+        offtopic_rule = 'Off-topic-Fragen sanft zurück zum Thema lenken'
 
     prompt_text = f"""Du bist Professor Wagner, ein erfahrener Pflegepädagoge mit 20 Jahren Unterrichtserfahrung.
-Du unterrichtest {first_name} im Modul „{module_title}" (Kurs: {course_title}).
+{role_line}
 
 ## Persönlichkeit
 - Freundlich, geduldig, ermutigend – du kennst die Herausforderungen der Pflegeausbildung
@@ -449,9 +479,9 @@ Du unterrichtest {first_name} im Modul „{module_title}" (Kurs: {course_title})
 4. REAGIEREN: Antwort bestätigen/korrigieren, dann nächsten Punkt einführen
 
 ## Regeln
-- Max. 4–5 Sätze pro Antwort (bei Begrüßung: exakt 1 Satz + erster Kernpunkt)
+- Max. 4–5 Sätze pro Antwort (bei Begrüßung: exakt 1 Satz + erster Kernpunkt{mixed_greeting_hint})
 - Jede Antwort endet mit einer Frage (außer bei direkten Faktenfragen)
-- Off-topic-Fragen sanft zurück zum Thema lenken
+- {offtopic_rule}
 - Immer auf Deutsch antworten{module_section}{today_section}"""
 
     if student_context:
@@ -460,7 +490,7 @@ Du unterrichtest {first_name} im Modul „{module_title}" (Kurs: {course_title})
 
 
 # ════════════════════════════════════════════════════════════
-#  FALLSTUDIE – Killer-Demo: Blutdruckmessung bei Frau Schmidt
+#  FALLSTUDIE – Fall: Blutdruckmessung bei Frau Schmidt
 # ════════════════════════════════════════════════════════════
 
 FALL_BLUTDRUCK = {
@@ -511,15 +541,34 @@ FALL_BLUTDRUCK = {
 
 
 def detect_fall_steps(case: dict, user_text: str, already_done: list) -> list:
-    """Return the keys of newly-completed steps after this user message."""
+    """Return the key of the newly-completed step after this user message.
+
+    Only the NEXT open step (in case order) can be completed per turn — later
+    steps are ignored even if their keywords appear, to enforce a strict
+    step-by-step flow without mid-case jumps.
+    """
     text = (user_text or '').lower()
-    newly = []
-    for step in case['steps']:
-        if step['key'] in already_done:
-            continue
-        if any(kw in text for kw in step['kw']):
-            newly.append(step['key'])
-    return newly
+    if not text:
+        return []
+
+    def norm(s: str) -> str:
+        s = (s or '').lower()
+        s = s.replace('ä', 'ae').replace('ö', 'oe').replace('ü', 'ue').replace('ß', 'ss')
+        return re.sub(r'\s+', ' ', s).strip()
+
+    norm_text = norm(text)
+    done_set = set(already_done or [])
+
+    next_open = next((s for s in case['steps'] if s['key'] not in done_set), None)
+    if not next_open:
+        return []
+
+    for kw in next_open['kw']:
+        kw_l = (kw or '').lower()
+        if kw_l in text or norm(kw_l) in norm_text:
+            return [next_open['key']]
+
+    return []
 
 
 def build_fall_blutdruck_prompt(first_name: str, language_level: str,
@@ -594,7 +643,7 @@ Du leitest {first_name} (Sprachniveau {language_level}) Schritt für Schritt dur
 - Genau EINE Frage pro Antwort
 - Niemals mehrere Schritte gleichzeitig abfragen
 - Keine Aufzählungen, kein Markdown — nur fließender Text
-- Bei „__GREETING__" sage exakt: „{first_name}, wir gehen ins Zimmer 214 zu Frau Schmidt. Sie klagt über Schwindel — was machst du als Erstes?"
+- Bei „__GREETING__" sage exakt: „{first_name}, wir gehen ins Zimmer zweihundertvierzehn zu Frau Schmidt. Sie klagt über Schwindel — was machst du als Erstes?"
 """
 
 
@@ -852,6 +901,44 @@ def generate_ai_quiz(module, language_level: str, num_questions: int = 5) -> lis
                 continue
             break
     return []
+
+
+def generate_quiz_fallback(module, num_questions: int = 5) -> list:
+    """Generate a deterministic local quiz when AI or DB questions are unavailable."""
+    title = (getattr(module, 'title', '') or 'dieses Thema').strip()
+    source = (getattr(module, 'content', '') or getattr(module, 'description', '') or '').strip()
+
+    if not source:
+        source = f'Grundlagen zu {title} in der Pflegepraxis.'
+
+    # Build short reference snippets to use as model answers.
+    snippets = [
+        s.strip() for s in re.split(r'[.!?]\s+', source)
+        if len(s.strip()) >= 20
+    ]
+    if not snippets:
+        snippets = [source]
+
+    prompts = [
+        f'Erklaere in eigenen Worten die wichtigsten Grundlagen von "{title}".',
+        f'Nenne zwei zentrale Inhalte aus dem Modul "{title}".',
+        'Welche pflegerische Handlung ist in diesem Kontext besonders wichtig und warum?',
+        'Welche typischen Fehler oder Risiken sollte man in diesem Thema vermeiden?',
+        'Wie wuerdest du das Thema einer Patientin oder einem Patienten einfach erklaeren?'
+    ]
+
+    questions = []
+    for i in range(max(1, num_questions)):
+        prompt = prompts[i] if i < len(prompts) else f'Beschreibe einen weiteren wichtigen Aspekt zu "{title}".'
+        model_answer = snippets[i % len(snippets)][:280]
+        questions.append({
+            'id': i,
+            'type': 'free_text',
+            'question': prompt,
+            'model_answer': model_answer,
+        })
+
+    return questions
 
 
 def evaluate_ai_answers(questions: list, student_answers: dict, language_level: str) -> list:

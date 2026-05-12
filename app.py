@@ -12,6 +12,7 @@ from services import (init_db, calculate_language_level, calculate_nursing_level
                       call_gemini_chat, build_ki_lehrer_system_prompt,
                       generate_slide_from_speech,
                       generate_ai_quiz, evaluate_ai_answers,
+                      generate_quiz_fallback,
                       generate_language_test_questions, generate_nursing_test_questions,
                       build_student_context, generate_flashcards, generate_library_summary,
                       generate_library_cards,
@@ -21,6 +22,17 @@ app = Flask(__name__)
 app.config['SQLALCHEMY_DATABASE_URI'] = 'sqlite:///carelearn.db'
 app.config['SQLALCHEMY_TRACK_MODIFICATIONS'] = False
 app.config['SECRET_KEY'] = os.environ.get('SECRET_KEY', 'carelearn-secret-key')
+
+
+def _env_flag(name: str, default: bool = False) -> bool:
+    value = os.environ.get(name)
+    if value is None:
+        return default
+    return str(value).strip().lower() in {'1', 'true', 'yes', 'on'}
+
+
+app.config['SESSION_COOKIE_SAMESITE'] = 'Lax'
+app.config['SESSION_COOKIE_SECURE'] = _env_flag('DEV_HTTPS', True)
 
 db.init_app(app)
 init_db(app)
@@ -49,6 +61,26 @@ def inject_user():
     if 'user_id' in session:
         user = User.query.get(session['user_id'])
     return {'current_user': user}
+
+
+def update_friend_mission_progress(student_id: int, xp_delta: int):
+    """Add XP to all active friend missions for the given student and mark completed ones."""
+    if xp_delta <= 0:
+        return
+
+    active_missions = FriendMission.query.filter(
+        FriendMission.completed == False,
+        db.or_(FriendMission.creator_id == student_id, FriendMission.friend_id == student_id)
+    ).all()
+
+    for mission in active_missions:
+        if mission.creator_id == student_id:
+            mission.creator_xp = (mission.creator_xp or 0) + xp_delta
+        if mission.friend_id == student_id:
+            mission.friend_xp = (mission.friend_xp or 0) + xp_delta
+
+        if (mission.creator_xp or 0) >= mission.target_xp and (mission.friend_xp or 0) >= mission.target_xp:
+            mission.completed = True
 
 
 # ── Öffentliche Seiten ─────────────────────────
@@ -301,9 +333,47 @@ def courses(user):
 @app.route('/courses/<int:course_id>')
 @login_required(role='student')
 def course_detail(user, course_id):
+    from sqlalchemy import func
+
     course = Course.query.get_or_404(course_id)
     enrolled = Enrollment.query.filter_by(course_id=course.id, student_id=user.id).first()
-    return render_template('course_detail.html', course=course, enrolled=enrolled)
+
+    module_stats = {}
+    attempt_summary = {}
+    module_ids = [m.id for m in course.modules]
+
+    if enrolled and module_ids:
+        rows = db.session.query(
+            QuizAttempt.module_id,
+            func.count(QuizAttempt.id),
+            func.max(QuizAttempt.pct)
+        ).filter(
+            QuizAttempt.student_id == user.id,
+            QuizAttempt.module_id.in_(module_ids)
+        ).group_by(QuizAttempt.module_id).all()
+
+        for module_id, attempts, best_pct in rows:
+            attempt_summary[module_id] = {
+                'attempts': int(attempts or 0),
+                'best_pct': int(best_pct or 0),
+            }
+
+    for module in course.modules:
+        db_question_count = len(module.quiz_questions or [])
+        summary = attempt_summary.get(module.id, {'attempts': 0, 'best_pct': 0})
+        module_stats[module.id] = {
+            'question_count': db_question_count if db_question_count > 0 else 5,
+            'question_source': 'custom' if db_question_count > 0 else 'ai',
+            'attempts': summary['attempts'],
+            'best_pct': summary['best_pct'],
+        }
+
+    return render_template(
+        'course_detail.html',
+        course=course,
+        enrolled=enrolled,
+        module_stats=module_stats,
+    )
 
 
 @app.route('/courses/<int:course_id>/enroll')
@@ -335,7 +405,33 @@ def course_module(user, course_id, module_id):
 @login_required(role='student')
 def course_quiz(user, course_id, module_id):
     module = Module.query.get_or_404(module_id)
-    return render_template('quiz.html', module=module, course_id=course_id)
+    source = (request.args.get('source') or '').strip().lower()
+
+    if source == 'learn':
+        cancel_url = url_for('learning_page', module_id=module.id)
+        cancel_label = 'Zurueck zu Lernen'
+    else:
+        cancel_url = url_for('course_module', course_id=course_id, module_id=module.id)
+        cancel_label = 'Quiz abbrechen'
+
+    return render_template(
+        'quiz.html',
+        module=module,
+        course_id=course_id,
+        cancel_url=cancel_url,
+        cancel_label=cancel_label,
+    )
+
+
+@app.route('/quiz', methods=['GET'])
+@login_required(role='student')
+def legacy_quiz_redirect(user):
+    module_id = request.args.get('module_id', type=int)
+    if not module_id:
+        return redirect(url_for('student_dashboard'))
+
+    module = Module.query.get_or_404(module_id)
+    return redirect(url_for('course_quiz', course_id=module.course_id, module_id=module.id))
 
 
 @app.route('/api/quiz/generate/<int:module_id>', methods=['GET'])
@@ -356,7 +452,10 @@ def api_quiz_generate(user, module_id):
                     'answer': q.answer.split(';')[0],
                 })
         else:
-            return jsonify({'error': 'Keine Fragen verfügbar – bitte Seite neu laden.'}), 503
+            questions = generate_quiz_fallback(module)
+
+    if not questions:
+        return jsonify({'error': 'Keine Fragen verfuegbar – bitte spaeter erneut versuchen.'}), 503
     return jsonify({'questions': questions})
 
 
@@ -408,6 +507,8 @@ def api_quiz_submit(user):
         today_goal = DailyGoal(student_id=user.id, date=_date.today())
         db.session.add(today_goal)
     today_goal.earned_xp = (today_goal.earned_xp or 0) + xp_earned
+
+    update_friend_mission_progress(user.id, xp_earned)
 
     enrollment = Enrollment.query.filter_by(student_id=user.id, course_id=module.course_id).first()
     if enrollment:
@@ -663,7 +764,20 @@ def ki_lehrer_api(user):
     is_greeting  = data.get('greeting', False)
 
     module_title = module_content = course_title = ''
-    if module_id:
+    is_mixed = (module_id == 'mixed')
+    enrolled_courses = [e.course for e in user.enrollments]
+
+    if is_mixed:
+        module_title = 'Gemischte Themen'
+        course_title = 'Alle Kurse'
+        mixed_parts = []
+        for course in enrolled_courses:
+            for module in course.modules:
+                body = (module.content or module.description or '').strip()
+                if body:
+                    mixed_parts.append(f"### {module.title} ({course.title})\n{body[:600]}")
+        module_content = '\n\n'.join(mixed_parts)[:4000]
+    elif module_id:
         module = Module.query.get(module_id)
         if module:
             module_title   = module.title
@@ -672,7 +786,6 @@ def ki_lehrer_api(user):
 
     # Today's topic set by the teacher
     today_module_title = today_course_title = ''
-    enrolled_courses = [e.course for e in user.enrollments]
     for course in enrolled_courses:
         if course.current_module_id:
             today_mod = Module.query.get(course.current_module_id)
@@ -685,15 +798,17 @@ def ki_lehrer_api(user):
         user.first_name, user.language_level,
         module_title, course_title, module_content,
         today_module_title, today_course_title,
-        build_student_context(user)
+        build_student_context(user),
+        is_mixed=is_mixed,
     )
 
     # Welcome without module: single short greeting sentence
     if is_greeting and not module_id and not conversation:
         welcome_system = (
-            f"Du bist Professor Wagner. Begrüße {user.first_name} mit genau einem einzigen Satz: "
-            f"'Hallo {user.first_name}, hier ist Prof. Wagner – bitte wähle oben ein Modul aus, um zu starten.' "
-            f"Sage exakt diesen Satz, leicht variiert, auf Deutsch. Kein weiterer Text."
+            f"Du bist Professor Wagner. Begrüße {user.first_name} freundlich mit genau einem Satz auf Deutsch. "
+            f"Sage sinngemäß: 'Hallo {user.first_name}, hier ist Prof. Wagner – wähle oben ein Modul aus "
+            f"oder starte mit Gemischte Themen, wenn du über alle Module sprechen möchtest.' "
+            f"Kein weiterer Text, keine Aufzählung."
         )
         response_text = call_gemini_chat(welcome_system, [{'role': 'user', 'text': '__WELCOME__'}])
         return jsonify({'response': response_text})
@@ -711,7 +826,7 @@ def ki_lehrer_api(user):
     slide_points = []
     slide_source = ''
     if module_id and speech and not speech.startswith('Fehler'):
-        slide_title, slide_points = generate_slide_from_speech(speech, module_title)
+        slide_title, slide_points = generate_slide_from_speech(speech, module_title or 'Gemischte Themen')
 
     return jsonify({'response': speech, 'slide_title': slide_title,
                     'slide_points': slide_points, 'slide_source': slide_source})
@@ -793,7 +908,10 @@ def stt_proxy():
 
     audio_data = request.get_data()
     if not audio_data:
-        return _j.dumps({'error': 'no audio'}), 400, {'Content-Type': 'application/json'}
+        # Availability probe — report whether any server-side STT is configured
+        has_stt = bool(os.environ.get('OPENAI_API_KEY', '')) or bool(os.environ.get('ELEVENLABS_API_KEY', ''))
+        body = {'available': True} if has_stt else {'error': 'stt_unavailable'}
+        return _j.dumps(body), 200, {'Content-Type': 'application/json'}
 
     content_type = request.content_type or 'audio/webm'
     ext = 'webm' if 'webm' in content_type else 'mp3' if 'mp3' in content_type else 'webm'
@@ -911,6 +1029,8 @@ def api_flashcard_review(user, card_id):
         db.session.add(today_goal)
     today_goal.earned_xp = (today_goal.earned_xp or 0) + xp_earned
 
+    update_friend_mission_progress(user.id, xp_earned)
+
     db.session.commit()
     return jsonify({'box': prog.box, 'xp_earned': xp_earned})
 
@@ -993,10 +1113,18 @@ def gamification(user):
     friends = user.friends.all() if user.friends else []
 
     # Friend missions
-    missions = FriendMission.query.filter(
+    missions_active = FriendMission.query.filter(
         db.or_(FriendMission.creator_id == user.id, FriendMission.friend_id == user.id),
         FriendMission.completed == False
-    ).all()
+    ).order_by(FriendMission.created_at.desc()).all()
+
+    missions_completed = FriendMission.query.filter(
+        db.or_(FriendMission.creator_id == user.id, FriendMission.friend_id == user.id),
+        FriendMission.completed == True
+    ).order_by(FriendMission.created_at.desc()).limit(20).all()
+
+    # Backward-compatible alias for existing templates/components
+    missions = missions_active
 
     # Lotto winners this week
     friday = today - timedelta(days=(today.weekday() - 4) % 7)
@@ -1006,7 +1134,10 @@ def gamification(user):
 
     return render_template('gamification.html',
         user=user, today_goal=today_goal, streak=streak,
-        leaderboard=leaderboard, friends=friends, missions=missions,
+        leaderboard=leaderboard, friends=friends,
+        missions=missions,
+        missions_active=missions_active,
+        missions_completed=missions_completed,
         lotto_winners=lotto_winners)
 
 
@@ -1113,22 +1244,62 @@ def api_lotto_draw(user):
 
 
 # ══════════════════════════════════════════════════════════
-#  FALLSTUDIE – Killer-Demo (Frau Schmidt, Blutdruckmessung)
+#  FALLSTUDIE – Fall: Blutdruckmessung bei Frau Schmidt
 # ══════════════════════════════════════════════════════════
 
 @app.route('/fall/blutdruck')
 @login_required(role='student')
 def fall_blutdruck(user):
-    return render_template('fall_blutdruck.html', user=user, case=FALL_BLUTDRUCK)
+    if request.args.get('reset') == '1':
+        session.pop('fall_blutdruck_completed', None)
+        session.pop('fall_blutdruck_awarded', None)
+        session.pop('fall_blutdruck_duration_sec', None)
+
+    valid_keys = {s['key'] for s in FALL_BLUTDRUCK['steps']}
+    stored_completed = session.get('fall_blutdruck_completed', [])
+    completed = [k for k in stored_completed if k in valid_keys]
+    session['fall_blutdruck_completed'] = completed
+
+    awarded = bool(session.get('fall_blutdruck_awarded', False))
+    elapsed_sec = int(session.get('fall_blutdruck_duration_sec', 0) or 0)
+
+    fall_resume = {
+        'completed': completed,
+        'finished': awarded or len(completed) >= len(FALL_BLUTDRUCK['steps']),
+        'elapsed_sec': max(0, elapsed_sec),
+    }
+
+    return render_template('fall_blutdruck.html', user=user, case=FALL_BLUTDRUCK, fall_resume=fall_resume)
 
 
 @app.route('/api/fall/blutdruck/turn', methods=['POST'])
 @login_required(role='student')
 def api_fall_blutdruck_turn(user):
     data = request.get_json(silent=True) or {}
-    conversation = data.get('conversation', [])
-    completed = list(data.get('completed', []) or [])
-    is_greeting = data.get('greeting', False)
+    raw_conversation = data.get('conversation', [])
+    is_greeting = bool(data.get('greeting', False))
+
+    valid_step_keys = [s['key'] for s in FALL_BLUTDRUCK['steps']]
+    valid_step_set = set(valid_step_keys)
+
+    stored_completed = session.get('fall_blutdruck_completed', [])
+    completed = []
+    for key in stored_completed:
+        if key in valid_step_set and key not in completed:
+            completed.append(key)
+
+    duration_sec = int(data.get('duration_sec', 0) or 0)
+    session['fall_blutdruck_duration_sec'] = max(0, duration_sec)
+
+    conversation = []
+    for turn in (raw_conversation or [])[-20:]:
+        if not isinstance(turn, dict):
+            continue
+        role = 'user' if turn.get('role') == 'user' else 'model'
+        text = str(turn.get('text', '')).strip()
+        if not text:
+            continue
+        conversation.append({'role': role, 'text': text[:1200]})
 
     last_user_text = ''
     for turn in reversed(conversation):
@@ -1139,7 +1310,11 @@ def api_fall_blutdruck_turn(user):
     newly_completed = []
     if last_user_text:
         newly_completed = detect_fall_steps(FALL_BLUTDRUCK, last_user_text, completed)
-        completed.extend(newly_completed)
+        for key in newly_completed:
+            if key in valid_step_set and key not in completed:
+                completed.append(key)
+
+    session['fall_blutdruck_completed'] = completed
 
     last_completed_key = newly_completed[0] if newly_completed else ''
     system = build_fall_blutdruck_prompt(
@@ -1150,13 +1325,14 @@ def api_fall_blutdruck_turn(user):
     if is_greeting and not conversation:
         contents = [{'role': 'user', 'text': '__GREETING__'}]
     else:
-        contents = [{'role': c['role'], 'text': c['text']} for c in conversation[-20:]]
+        contents = conversation
 
     speech = call_gemini_chat(system, contents)
 
-    finished = len(completed) >= len(FALL_BLUTDRUCK['steps'])
+    finished = len(completed) >= len(valid_step_keys)
     xp_awarded = 0
-    if finished and not data.get('already_finished', False):
+    already_awarded = bool(session.get('fall_blutdruck_awarded', False))
+    if finished and not already_awarded:
         xp_awarded = 80
         user.xp = (user.xp or 0) + xp_awarded
         from datetime import date as _date, datetime as _dt
@@ -1167,18 +1343,21 @@ def api_fall_blutdruck_turn(user):
             db.session.add(goal)
         goal.earned_xp = (goal.earned_xp or 0) + xp_awarded
 
+        update_friend_mission_progress(user.id, xp_awarded)
+
         # Save case study attempt
         attempt = CaseStudyAttempt(
             student_id=user.id,
             case_key='blutdruck',
             steps_completed=len(completed),
-            steps_total=len(FALL_BLUTDRUCK['steps']),
+            steps_total=len(valid_step_keys),
             xp_earned=xp_awarded,
-            duration_sec=data.get('duration_sec', 0),
+            duration_sec=max(0, duration_sec),
             completed=True,
         )
         db.session.add(attempt)
         db.session.commit()
+        session['fall_blutdruck_awarded'] = True
 
     return jsonify({
         'response': speech,
@@ -1324,4 +1503,15 @@ def debug_env():
 
 
 if __name__ == '__main__':
-    app.run(debug=True)
+    host = os.environ.get('HOST', '127.0.0.1')
+    port = int(os.environ.get('PORT', os.environ.get('FLASK_RUN_PORT', '5001')))
+    debug = _env_flag('FLASK_DEBUG', True)
+    use_https = _env_flag('DEV_HTTPS', True)
+    ssl_context = 'adhoc' if use_https else None
+
+    scheme = 'https' if use_https else 'http'
+    print(f'careLearn läuft auf {scheme}://{host}:{port}')
+    if use_https:
+        print('Hinweis: Beim ersten Start das lokale Zertifikat im Browser bestätigen.')
+
+    app.run(debug=debug, host=host, port=port, ssl_context=ssl_context)

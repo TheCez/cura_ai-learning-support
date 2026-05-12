@@ -15,7 +15,12 @@
       "Bash(cmd.exe /c \"taskkill /F /IM python.exe 2>nul\")",
       "Bash(venv/Scripts/python.exe -m pip install pypdf)",
       "Bash(venv/Scripts/python.exe -c \"import py_compile; py_compile.compile\\('services.py', doraise=True\\); py_compile.compile\\('app.py', doraise=True\\); py_compile.compile\\('models.py', doraise=True\\); print\\('OK'\\)\")",
-      "Bash(venv/Scripts/python.exe -c \"import py_compile; py_compile.compile\\('models.py', doraise=True\\); print\\('OK'\\)\")"
+      "Bash(venv/Scripts/python.exe -c \"import py_compile; py_compile.compile\\('models.py', doraise=True\\); print\\('OK'\\)\")",
+      "Bash(python -c \"import services; import app; print\\('OK'\\)\")",
+      "Bash(python -m py_compile services.py)",
+      "Bash(python -m py_compile app.py)",
+      "Bash(node -e ' *)",
+      "Bash(python -m py_compile services.py app.py)"
     ]
   }
 }

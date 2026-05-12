@@ -17,7 +17,7 @@
       {% for course in enrolled_courses %}
         <optgroup label="{{ course.title }}">
           {% for module in course.modules %}
-            <option value="{{ module.id }}">{{ module.title }}</option>
+            <option value="{{ module.id }}" data-course-id="{{ course.id }}">{{ module.title }}</option>
           {% endfor %}
         </optgroup>
       {% endfor %}
@@ -93,8 +93,13 @@
     <!-- Quiz Panel -->
     <div class="learn-panel" id="panel-quiz">
       <div id="quiz-area">
-        <p class="learn-empty">Wähle ein Modul und starte dann ein Quiz.</p>
-        <button class="button" id="start-quiz-btn" style="display:none;">Quiz starten</button>
+        <div id="quiz-start-state">
+          <p class="learn-empty" id="quiz-start-message">Wähle ein Modul und starte dann ein Quiz.</p>
+          <div class="form-actions">
+            <button class="button" id="start-quiz-btn" style="display:none;">Quiz starten</button>
+          </div>
+        </div>
+        <div id="quiz-inline-container"></div>
       </div>
     </div>
   </div>
@@ -122,42 +127,120 @@ function getAllModuleIds() {
   const opts = document.querySelectorAll('#learn-module-select option[value]');
   return Array.from(opts).map(o => o.value).filter(v => v && v !== 'random');
 }
-function pickRandomModuleId() {
-  const ids = getAllModuleIds();
-  return ids.length ? ids[Math.floor(Math.random() * ids.length)] : null;
+function getModuleMeta(moduleId) {
+  const option = document.querySelector(`#learn-module-select option[value="${moduleId}"]`);
+  if (!option) return null;
+  return {
+    moduleId: option.value,
+    courseId: option.dataset.courseId || ''
+  };
 }
-function getActiveModuleId() {
+function pickRandomModuleMeta() {
+  const ids = getAllModuleIds();
+  if (!ids.length) return null;
+  return getModuleMeta(ids[Math.floor(Math.random() * ids.length)]);
+}
+function getActiveModuleMeta() {
   const sel = document.getElementById('learn-module-select').value;
-  if (sel && sel !== 'random') return sel;
-  return pickRandomModuleId();
+  if (sel && sel !== 'random') return getModuleMeta(sel);
+  return pickRandomModuleMeta();
+}
+function getRequestedModuleId() {
+  const params = new URLSearchParams(window.location.search);
+  const mid = params.get('module_id');
+  if (!mid) return '';
+  return getModuleMeta(mid) ? mid : '';
+}
+
+let learnQuizQuestions = [];
+let learnQuizModuleId = null;
+let learnQuizController = null;
+let learnQuizCancelled = false;
+
+function getModuleTitle(moduleId) {
+  const option = document.querySelector(`#learn-module-select option[value="${moduleId}"]`);
+  return option ? option.textContent.trim() : 'dem Modul';
+}
+
+function getCurrentQuizModuleId() {
+  const button = document.getElementById('start-quiz-btn');
+  const selected = getActiveModuleMeta();
+  return button.dataset.moduleId || (selected && selected.moduleId) || '';
+}
+
+function resetQuizArea(moduleId, statusMessage = '') {
+  const startState = document.getElementById('quiz-start-state');
+  const startMessage = document.getElementById('quiz-start-message');
+  const startButton = document.getElementById('start-quiz-btn');
+  const inlineContainer = document.getElementById('quiz-inline-container');
+
+  if (learnQuizController) {
+    try {
+      learnQuizController.abort();
+    } catch (e) {}
+  }
+
+  learnQuizQuestions = [];
+  learnQuizModuleId = moduleId ? parseInt(moduleId, 10) : null;
+  learnQuizController = null;
+  learnQuizCancelled = false;
+
+  inlineContainer.innerHTML = '';
+  startState.style.display = 'block';
+
+  if (moduleId) {
+    startButton.style.display = 'inline-block';
+    startButton.dataset.moduleId = String(moduleId);
+  } else {
+    startButton.style.display = 'none';
+    startButton.dataset.moduleId = '';
+  }
+
+  if (statusMessage) {
+    startMessage.textContent = statusMessage;
+  } else if (moduleId) {
+    startMessage.textContent = `Bereit für ein Quiz zu "${getModuleTitle(moduleId)}"?`;
+  } else {
+    startMessage.textContent = 'Wähle ein Modul und starte dann ein Quiz.';
+  }
+}
+
+function loadModuleContent(mid) {
+  if (!mid) return;
+  const selected = getModuleMeta(mid);
+  document.getElementById('learn-module-hint').textContent = '';
+  loadFlashcards(mid);
+  loadLibrary(mid);
+
+  const quizButton = document.getElementById('start-quiz-btn');
+  quizButton.dataset.moduleId = mid;
+  quizButton.dataset.courseId = selected ? selected.courseId : '';
+  resetQuizArea(mid);
 }
 
 document.addEventListener('DOMContentLoaded', () => {
   const moduleSelect = document.getElementById('learn-module-select');
 
-  function loadModuleContent(mid) {
-    if (!mid) return;
-    document.getElementById('learn-module-hint').textContent = '';
-    loadFlashcards(mid);
-    loadLibrary(mid);
-    document.getElementById('start-quiz-btn').style.display = 'inline-block';
-    document.getElementById('start-quiz-btn').dataset.moduleId = mid;
-  }
-
   moduleSelect.addEventListener('change', () => {
-    const mid = getActiveModuleId();
-    loadModuleContent(mid);
+    const selected = getActiveModuleMeta();
+    loadModuleContent(selected && selected.moduleId);
   });
 
   document.getElementById('start-quiz-btn').addEventListener('click', () => {
-    const mid = document.getElementById('start-quiz-btn').dataset.moduleId || getActiveModuleId();
-    window.location.href = `/quiz?module_id=${mid}`;
+    const moduleId = getCurrentQuizModuleId();
+    if (!moduleId) return;
+    startInlineQuiz(moduleId);
   });
 
+  const requestedModuleId = getRequestedModuleId();
+  if (requestedModuleId) {
+    moduleSelect.value = requestedModuleId;
+  }
+
   // Auto-load random module on page init
-  const initialMid = getActiveModuleId();
-  if (initialMid) {
-    loadModuleContent(initialMid);
+  const initialSelection = getActiveModuleMeta();
+  if (initialSelection && initialSelection.moduleId) {
+    loadModuleContent(initialSelection.moduleId);
   }
 });
 
@@ -165,12 +248,9 @@ let currentSection = null;
 function switchSection(section) {
   /* If no content loaded yet, pick a random module */
   if (!document.getElementById('start-quiz-btn').dataset.moduleId) {
-    const mid = getActiveModuleId();
-    if (mid) {
-      loadFlashcards(mid);
-      loadLibrary(mid);
-      document.getElementById('start-quiz-btn').style.display = 'inline-block';
-      document.getElementById('start-quiz-btn').dataset.moduleId = mid;
+    const selected = getActiveModuleMeta();
+    if (selected && selected.moduleId) {
+      loadModuleContent(selected.moduleId);
     }
   }
   currentSection = section;
@@ -183,6 +263,9 @@ function switchSection(section) {
   document.getElementById('learn-active-section').scrollIntoView({behavior: 'smooth'});
 }
 function closeSection() {
+  if (currentSection === 'quiz') {
+    abortInlineQuiz(false);
+  }
   document.getElementById('learn-active-section').style.display = 'none';
   document.getElementById('learn-grid').style.display = 'grid';
   currentSection = null;
@@ -312,8 +395,18 @@ window.setLibLang = function(simple, moduleId) {
 window.deepenWithProf = function(cardIndex, moduleId) {
   const card = libCards[cardIndex];
   if (!card) return;
-  const q = encodeURIComponent(`Erkläre mir bitte das Thema "${card.title}" genauer.`);
-  window.location.href = `/ki-lehrer?frage=${q}`;
+
+  const summaryRaw = libSimple ? (card.simple || '') : (card.technical || card.simple || '');
+  const summary = summaryRaw.replace(/\s+/g, ' ').trim().slice(0, 280);
+  const question = summary
+    ? `Bitte vertiefe mit mir das Thema "${card.title}". Das habe ich aus der Bibliothek verstanden: ${summary}`
+    : `Bitte vertiefe mit mir das Thema "${card.title}".`;
+
+  const params = new URLSearchParams({
+    module_id: String(moduleId),
+    frage: question,
+  });
+  window.location.href = `/ki-lehrer?${params.toString()}`;
 };
 
 window.askLibrary = async function(moduleId) {
@@ -333,6 +426,221 @@ window.askLibrary = async function(moduleId) {
     ansEl.innerHTML = '<p class="learn-error">Fehler bei der Antwort.</p>';
   }
 };
+
+// ── Quiz (inline in Lernen) ──
+function renderInlineQuizLoading(text) {
+  const inlineContainer = document.getElementById('quiz-inline-container');
+  document.getElementById('quiz-start-state').style.display = 'none';
+  inlineContainer.innerHTML =
+    '<div class="learn-loading"><div class="loading-dots"><span></span><span></span><span></span></div> ' + escHtml(text) + '</div>' +
+    '<div class="form-actions"><button class="button button-secondary" type="button" onclick="abortInlineQuiz()">Quiz abbrechen</button></div>';
+}
+
+function renderInlineQuizError(message) {
+  const inlineContainer = document.getElementById('quiz-inline-container');
+  document.getElementById('quiz-start-state').style.display = 'none';
+  inlineContainer.innerHTML =
+    `<p class="learn-error">${escHtml(message)}</p>` +
+    '<div class="form-actions">' +
+    '<button class="button" type="button" onclick="startInlineQuiz()">Erneut versuchen</button>' +
+    '<button class="button button-secondary" type="button" onclick="abortInlineQuiz()">Quiz abbrechen</button>' +
+    '</div>';
+}
+
+function renderInlineQuizForm(questions) {
+  const inlineContainer = document.getElementById('quiz-inline-container');
+  document.getElementById('quiz-start-state').style.display = 'none';
+
+  const questionBlocks = questions.map((q, i) => {
+    const counter = `<div class="question-counter">Frage ${i + 1} / ${questions.length}${
+      q.type === 'free_text' ? ' <span class="multi-hint">(Freitext)</span>' : ''
+    }</div>`;
+    const text = `<p class="question-text"><strong>${escHtml(q.question)}</strong></p>`;
+
+    let input = '';
+    if (q.type === 'multiple_choice') {
+      input = (q.options || []).map(opt =>
+        `<label class="option-label">
+           <input type="radio" name="answer_${i}" value="${escAttr(opt)}" required>
+           <span>${escHtml(opt)}</span>
+         </label>`
+      ).join('');
+    } else {
+      input = `<input class="text-answer-input" type="text" name="answer_${i}" placeholder="Deine Antwort auf Deutsch …" autocomplete="off">`;
+    }
+
+    return `<div class="question-block">${counter}${text}${input}</div>`;
+  }).join('');
+
+  inlineContainer.innerHTML =
+    '<div class="quiz-progress-row">' +
+    `<span class="quiz-progress-text">${questions.length} Fragen</span>` +
+    '</div>' +
+    '<form id="learn-quiz-form">' +
+    questionBlocks +
+    '<div class="form-actions">' +
+    '<button class="button button-secondary" type="button" onclick="abortInlineQuiz()">Quiz abbrechen</button>' +
+    '<button class="button" type="submit">Quiz auswerten</button>' +
+    '</div>' +
+    '</form>';
+
+  const formEl = document.getElementById('learn-quiz-form');
+  formEl.addEventListener('submit', (e) => {
+    e.preventDefault();
+    submitInlineQuiz(formEl);
+  });
+}
+
+async function startInlineQuiz(moduleId) {
+  const mid = moduleId || getCurrentQuizModuleId();
+  if (!mid) return;
+
+  learnQuizModuleId = parseInt(mid, 10);
+  learnQuizQuestions = [];
+  learnQuizCancelled = false;
+
+  if (learnQuizController) {
+    try {
+      learnQuizController.abort();
+    } catch (e) {}
+  }
+  learnQuizController = new AbortController();
+
+  renderInlineQuizLoading('KI generiert personalisierte Fragen für dich …');
+
+  try {
+    const res = await fetch(`/api/quiz/generate/${mid}`, { signal: learnQuizController.signal });
+    const data = await res.json();
+    if (learnQuizCancelled) return;
+
+    if (data.error) {
+      renderInlineQuizError(data.error);
+      return;
+    }
+
+    const questions = data.questions || [];
+    if (!questions.length) {
+      renderInlineQuizError('Keine Fragen verfügbar – bitte später erneut versuchen.');
+      return;
+    }
+
+    learnQuizQuestions = questions;
+    renderInlineQuizForm(questions);
+  } catch (e) {
+    if (e && e.name === 'AbortError') return;
+    renderInlineQuizError('Fehler beim Laden der Fragen. Bitte erneut versuchen.');
+  } finally {
+    learnQuizController = null;
+  }
+}
+
+async function submitInlineQuiz(formEl) {
+  if (!learnQuizQuestions.length || !learnQuizModuleId) return;
+
+  const answers = {};
+  learnQuizQuestions.forEach((q, i) => {
+    const el = formEl.elements[`answer_${i}`];
+    answers[i] = el ? el.value : '';
+  });
+
+  learnQuizCancelled = false;
+  if (learnQuizController) {
+    try {
+      learnQuizController.abort();
+    } catch (e) {}
+  }
+  learnQuizController = new AbortController();
+
+  renderInlineQuizLoading('KI bewertet deine Antworten …');
+
+  try {
+    const res = await fetch('/api/quiz/submit', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      signal: learnQuizController.signal,
+      body: JSON.stringify({
+        module_id: learnQuizModuleId,
+        questions: learnQuizQuestions,
+        answers,
+      })
+    });
+    const data = await res.json();
+    if (learnQuizCancelled) return;
+
+    if (data.error) {
+      renderInlineQuizError(data.error);
+      return;
+    }
+
+    renderInlineQuizResults(data);
+  } catch (e) {
+    if (e && e.name === 'AbortError') return;
+    renderInlineQuizError('Fehler bei der Auswertung. Bitte erneut versuchen.');
+  } finally {
+    learnQuizController = null;
+  }
+}
+
+function renderInlineQuizResults(data) {
+  const pct = data.pct || 0;
+  const score = data.score || 0;
+  const total = data.total || 0;
+  const results = data.results || [];
+
+  const scoreClass = pct >= 80 ? 'score-good' : pct >= 50 ? 'score-ok' : 'score-low';
+
+  const details = results.map((r, i) =>
+    `<div class="question-block ${r.is_correct ? 'correct' : 'wrong'}">
+       <div class="answer-status">${r.is_correct ? '✓' : '✗'}</div>
+       <p><strong>${i + 1}. ${escHtml(r.question)}</strong></p>
+       <p>Deine Antwort: <em>${escHtml(r.student_answer || '(keine Angabe)')}</em></p>
+       ${r.feedback ? `<p class="ai-feedback">${escHtml(r.feedback)}</p>` : ''}
+       ${!r.is_correct ? `<p class="correct-hint">Musterantwort: <strong>${escHtml(r.correct_answer)}</strong></p>` : ''}
+     </div>`
+  ).join('');
+
+  const inlineContainer = document.getElementById('quiz-inline-container');
+  document.getElementById('quiz-start-state').style.display = 'none';
+
+  inlineContainer.innerHTML =
+    `<h3>Quiz-Ergebnis</h3>
+     <div class="result-summary">
+       <div class="result-score ${scoreClass}">${score}/${total}</div>
+       <div class="result-info">
+         <p class="result-pct">${pct}% richtig</p>
+       </div>
+     </div>
+     <section class="answer-review">
+       <h4>Antworten im Detail</h4>
+       ${details}
+     </section>
+     <div class="spaced-review-box">
+       <div class="spaced-review-icon">${pct >= 70 ? '🧠' : '📅'}</div>
+       <div>
+         <strong>Wiederholung eingeplant:</strong>
+         Nächste Übung empfohlen am <strong>${escHtml(data.next_review_date || '–')}</strong>
+       </div>
+     </div>
+     <div class="form-actions">
+       <button class="button" type="button" onclick="startInlineQuiz()">Neues Quiz starten</button>
+       <button class="button button-secondary" type="button" onclick="abortInlineQuiz()">Quiz abbrechen</button>
+       <button class="button button-secondary" type="button" onclick="closeSection()">Zurück zur Übersicht</button>
+     </div>`;
+}
+
+function abortInlineQuiz(showNotice = true) {
+  learnQuizCancelled = true;
+  if (learnQuizController) {
+    try {
+      learnQuizController.abort();
+    } catch (e) {}
+    learnQuizController = null;
+  }
+  resetQuizArea(getCurrentQuizModuleId(), showNotice ? 'Quiz wurde abgebrochen.' : '');
+}
+
+window.startInlineQuiz = startInlineQuiz;
+window.abortInlineQuiz = abortInlineQuiz;
 
 // ── Quick Prof Question ──
 async function askProfQuick() {
@@ -354,6 +662,16 @@ async function askProfQuick() {
   }
 }
 window.askProfQuick = askProfQuick;
+
+function escHtml(str) {
+  const d = document.createElement('div');
+  d.textContent = String(str || '');
+  return d.innerHTML;
+}
+
+function escAttr(str) {
+  return String(str || '').replace(/"/g, '&quot;');
+}
 
 function formatText(text) {
   return text

@@ -1,12 +1,12 @@
 {% extends 'base.html' %}
 {% block content %}
 
-<!-- Killer Demo Teaser -->
+<!-- Fallstudie Teaser -->
 <div class="killer-banner">
   <div class="killer-banner-icon">🎓</div>
   <div class="killer-banner-content">
     <h2 class="killer-banner-title">
-      Killer-Demo: Blutdruckmessung bei Frau Schmidt
+      Fall: Blutdruckmessung bei Frau Schmidt
       <span class="chip-accent">Voice · Live</span>
     </h2>
     <p class="killer-banner-desc">
@@ -14,7 +14,7 @@
       und führt dich Schritt für Schritt durch die Messung. Per Stimme, auf deinem Sprachniveau.
     </p>
     {% if current_user %}
-      <a class="button" href="{{ url_for('fall_blutdruck') }}">Fall jetzt starten →</a>
+      <a class="button" href="{{ url_for('fall_blutdruck') }}">Fall mit Prof.-Stimme starten →</a>
     {% else %}
       <a class="button" href="{{ url_for('register') }}">Registrieren & ausprobieren →</a>
     {% endif %}

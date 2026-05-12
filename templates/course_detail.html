@@ -23,12 +23,16 @@
   </div>
 
   <p>{{ course.summary }}</p>
+  <div class="form-actions">
+    <a class="button button-secondary" href="{{ url_for('student_dashboard') }}">Abbrechen</a>
+  </div>
 
   <section>
     <h2>Module</h2>
     {% if course.modules %}
       <div class="module-list">
         {% for module in course.modules %}
+          {% set stats = module_stats.get(module.id) if module_stats else None %}
           <article class="module-card">
             <div class="module-card-header">
               <div>
@@ -37,8 +41,12 @@
               </div>
               <div>
                 <span class="badge">{{ module.module_type }}</span>
-                {% if module.module_type == 'quiz' %}
-                  <div class="meta">{{ module.quiz_questions|length }} Fragen</div>
+                {% if stats %}
+                  <div class="meta">
+                    {{ stats.question_count }} Quizfragen{% if stats.question_source == 'ai' %} (KI){% endif %}
+                    · {{ stats.attempts }} Versuch{% if stats.attempts != 1 %}e{% endif %}
+                    {% if stats.attempts > 0 %}· Beste Quote {{ stats.best_pct }}%{% endif %}
+                  </div>
                 {% endif %}
               </div>
             </div>

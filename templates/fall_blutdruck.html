@@ -11,9 +11,17 @@
 }
 </script>
 
-<script>window._fallCase = {{ case | tojson }};</script>
+<script>
+window._fallCase = {{ case | tojson }};
+window._fallResume = {{ fall_resume | tojson }};
+</script>
 
 <div class="fall-shell">
+
+  <div class="notice warning hidden" id="fall-security-hint">
+    Die Verbindung läuft aktuell über HTTP. Für sichere Audio-Anfragen bitte die HTTPS-Version öffnen.
+    <a id="fall-open-secure" href="#">Sichere Verbindung öffnen</a>
+  </div>
 
   <!-- ── Header ──────────────────────────────────── -->
   <div class="fall-header">
@@ -23,6 +31,7 @@
     </div>
     <div class="fall-meta">
       <span class="fall-timer" id="fall-timer">00:00</span>
+      <a class="button button-sm button-secondary" href="{{ url_for('fall_blutdruck', reset=1) }}">Neu starten</a>
       <a class="button button-sm button-secondary" href="{{ url_for('student_dashboard') }}">Abbrechen</a>
     </div>
   </div>
@@ -115,7 +124,7 @@
       <div class="fall-xp-display">+<span id="fall-xp-amount">80</span> XP</div>
       <div class="fall-overlay-actions">
         <a class="button" href="{{ url_for('student_dashboard') }}">Zurück zum Dashboard</a>
-        <button class="button button-secondary" onclick="location.reload()">Fall wiederholen</button>
+        <button class="button button-secondary" onclick="location.href='{{ url_for('fall_blutdruck', reset=1) }}'">Fall wiederholen</button>
       </div>
     </div>
   </div>
@@ -130,12 +139,21 @@ let fallFinished     = false;
 let fallIsLoading    = false;
 let fallIsRecording  = false;
 let fallContinuous   = false;
+let fallPendingSpeech = '';
+let fallHasInteracted = false;
+const fallResumeState = window._fallResume || {completed: [], finished: false, elapsed_sec: 0};
+let fallElapsedBaseSec = Number(fallResumeState.elapsed_sec || 0);
+if (!Number.isFinite(fallElapsedBaseSec) || fallElapsedBaseSec < 0) fallElapsedBaseSec = 0;
 let fallStartTime    = Date.now();
 const fallSteps      = window._fallCase.steps;
 
 // ── Timer ──────────────────────────────────────
+function fallCurrentDurationSec() {
+  return fallElapsedBaseSec + Math.floor((Date.now() - fallStartTime) / 1000);
+}
+
 setInterval(() => {
-  const sec = Math.floor((Date.now() - fallStartTime) / 1000);
+  const sec = fallCurrentDurationSec();
   const mm = String(Math.floor(sec / 60)).padStart(2, '0');
   const ss = String(sec % 60).padStart(2, '0');
   const el = document.getElementById('fall-timer');
@@ -146,6 +164,71 @@ setInterval(() => {
 function fallEsc(s) {
   return String(s||'').replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;');
 }
+
+function fallNormalizeSpeechText(text) {
+  return String(text || '')
+    .replace(/\bZimmer\s*214\b/gi, 'Zimmer zweihundertvierzehn')
+    .replace(/\b214\b/g, 'zweihundertvierzehn');
+}
+
+function fallIsInsecureDevContext() {
+  const host = window.location.hostname;
+  return window.location.protocol === 'http:' && (host === '127.0.0.1' || host === 'localhost');
+}
+
+if (fallIsInsecureDevContext()) {
+  console.info('Hinweis: STT läuft lokal über HTTP. Für eine sichere Anforderung starte die App mit DEV_HTTPS=1 und öffne https://127.0.0.1:5001.');
+}
+
+function fallInitSecureHint() {
+  const hint = document.getElementById('fall-security-hint');
+  const link = document.getElementById('fall-open-secure');
+  if (!hint || !link) return;
+
+  if (!fallIsInsecureDevContext()) {
+    hint.classList.add('hidden');
+    return;
+  }
+
+  const secureUrl = `https://${window.location.host}${window.location.pathname}${window.location.search}${window.location.hash}`;
+  link.setAttribute('href', secureUrl);
+  hint.classList.remove('hidden');
+}
+
+function fallSpeakSafe(text) {
+  const normalized = fallNormalizeSpeechText(text);
+  if (!normalized) return;
+
+  if (!window.fallSpeak) {
+    fallPendingSpeech = normalized;
+    return;
+  }
+
+  try {
+    const maybePromise = window.fallSpeak(normalized);
+    if (maybePromise && typeof maybePromise.then === 'function') {
+      maybePromise.catch(() => { fallPendingSpeech = normalized; });
+    }
+  } catch (e) {
+    fallPendingSpeech = normalized;
+  }
+}
+
+function fallFlushPendingSpeech() {
+  if (!fallPendingSpeech) return;
+  const text = fallPendingSpeech;
+  fallPendingSpeech = '';
+  fallSpeakSafe(text);
+}
+
+function fallUnlockAudioFromGesture() {
+  fallHasInteracted = true;
+  window.fallResumeAudio && window.fallResumeAudio();
+  fallFlushPendingSpeech();
+}
+
+window.addEventListener('pointerdown', fallUnlockAudioFromGesture, {passive: true});
+window.addEventListener('keydown', fallUnlockAudioFromGesture);
 
 function fallAddBubble(role, text) {
   const chat = document.getElementById('fall-chat');
@@ -213,6 +296,36 @@ function fallShowFinish(xp) {
 
 // ── Greeting ───────────────────────────────────
 window.addEventListener('DOMContentLoaded', () => {
+  fallInitSecureHint();
+
+  const resumeCompleted = Array.isArray(fallResumeState.completed) ? fallResumeState.completed : [];
+  const resumeFinished = !!fallResumeState.finished;
+
+  if (resumeCompleted.length > 0) {
+    fallCompleted = resumeCompleted.slice();
+    fallFinished = resumeFinished;
+    fallUpdateChecklist(fallCompleted, []);
+    document.getElementById('fall-placeholder').style.display = 'none';
+
+    if (fallFinished) {
+      const doneText = 'Willkommen zurück. Dieser Fall ist bereits abgeschlossen.';
+      fallConversation.push({role: 'model', text: doneText});
+      fallAddBubble('professor', doneText);
+      fallSetInputEnabled(false);
+      fallSpeakSafe(doneText);
+      fallShowFinish(80);
+      return;
+    }
+
+    const nextStep = Math.min(fallCompleted.length + 1, fallSteps.length);
+    const resumeText = `Willkommen zurück. Wir machen weiter mit Schritt ${nextStep}. Was machst du als Nächstes?`;
+    fallConversation.push({role: 'model', text: resumeText});
+    fallAddBubble('professor', resumeText);
+    fallSetInputEnabled(true);
+    fallSpeakSafe(resumeText);
+    return;
+  }
+
   fallShowLoading();
   fetch('/api/fall/blutdruck/turn', {
     method: 'POST',
@@ -227,7 +340,7 @@ window.addEventListener('DOMContentLoaded', () => {
     fallConversation.push({role: 'model', text});
     fallAddBubble('professor', text);
     fallSetInputEnabled(true);
-    if (window.fallSpeak) window.fallSpeak(text);
+    fallSpeakSafe(text);
   })
   .catch(() => {
     fallRemoveLoading();
@@ -255,9 +368,7 @@ function fallSend() {
     headers: {'Content-Type': 'application/json'},
     body: JSON.stringify({
       conversation: fallConversation.slice(-20),
-      completed: fallCompleted,
-      already_finished: fallFinished,
-      duration_sec: Math.floor((Date.now() - fallStartTime) / 1000),
+      duration_sec: fallCurrentDurationSec(),
     })
   })
   .then(r => r.json())
@@ -268,7 +379,7 @@ function fallSend() {
     fallAddBubble('professor', resp);
     fallCompleted = data.completed || fallCompleted;
     fallUpdateChecklist(fallCompleted, data.newly_completed || []);
-    if (window.fallSpeak) window.fallSpeak(resp);
+    fallSpeakSafe(resp);
 
     if (data.finished && !fallFinished) {
       fallFinished = true;
@@ -285,14 +396,30 @@ function fallSend() {
   });
 }
 
-// ── Voice (Whisper-only via /api/stt) ──────────
+// ── Voice Input (Whisper/Scribe via /api/stt, Web Speech fallback) ──
+let fallSttMode = 'unknown';   // 'elevenlabs' | 'webspeech'
 let fallMediaRecorder = null;
 let fallAudioChunks = [];
 let fallSilenceTimer = null;
 let fallAudioAnalyser = null;
 let fallAudioStream = null;
 let fallHadSpeech = false;
+let fallWebSpeechRec = null;
 const FALL_SILENCE = 6, FALL_SPEECH = 12;
+
+async function fallDetectSttMode() {
+  try {
+    const r = await fetch('/api/stt', {
+      method: 'POST',
+      headers: {'Content-Type': 'audio/webm'},
+      body: new Blob([], {type: 'audio/webm'})
+    });
+    const d = await r.json();
+    fallSttMode = (d.error === 'stt_unavailable') ? 'webspeech' : 'elevenlabs';
+  } catch (e) {
+    fallSttMode = 'webspeech';
+  }
+}
 
 function fallToggleMic() {
   window.fallResumeAudio && window.fallResumeAudio();
@@ -305,6 +432,15 @@ function fallToggleMic() {
 async function fallStartMic() {
   if (fallIsRecording || fallIsLoading || fallFinished) return;
 
+  if (fallSttMode === 'unknown') await fallDetectSttMode();
+
+  // ── Path A: Web Speech API (browser-native) ─────────────
+  if (fallSttMode === 'webspeech') {
+    fallStartWebSpeech();
+    return;
+  }
+
+  // ── Path B: MediaRecorder → server STT ──────────────────
   let stream;
   try { stream = await navigator.mediaDevices.getUserMedia({audio: true}); }
   catch (e) { fallContinuous = false; fallUpdateMicUI(); alert('Mikrofon: ' + e.message); return; }
@@ -343,10 +479,52 @@ async function fallStartMic() {
   fallMediaRecorder.start(100);
 }
 
+function fallStartWebSpeech() {
+  const SR = window.SpeechRecognition || window.webkitSpeechRecognition;
+  if (!SR) {
+    alert('Dein Browser unterstützt keine Spracheingabe. Bitte Chrome, Edge oder Safari nutzen.');
+    fallContinuous = false; fallUpdateMicUI();
+    return;
+  }
+  fallIsRecording = true;
+  fallUpdateMicUI();
+  document.getElementById('fall-mic-status').classList.remove('hidden');
+
+  fallWebSpeechRec = new SR();
+  fallWebSpeechRec.lang = 'de-DE';
+  fallWebSpeechRec.interimResults = false;
+  fallWebSpeechRec.maxAlternatives = 1;
+
+  fallWebSpeechRec.onresult = e => {
+    const text = (e.results[0][0].transcript || '').trim();
+    fallIsRecording = false;
+    fallUpdateMicUI();
+    document.getElementById('fall-text-input').value = text;
+    if (text) fallSend();
+    else if (fallContinuous && !fallIsLoading) setTimeout(fallStartMic, 300);
+  };
+  fallWebSpeechRec.onerror = () => {
+    fallIsRecording = false;
+    fallUpdateMicUI();
+    if (fallContinuous && !fallIsLoading) setTimeout(fallStartMic, 500);
+  };
+  fallWebSpeechRec.onend = () => {
+    fallIsRecording = false;
+    fallUpdateMicUI();
+    if (fallContinuous && !fallIsLoading) setTimeout(fallStartMic, 300);
+  };
+  try { fallWebSpeechRec.start(); }
+  catch (e) {
+    fallIsRecording = false; fallUpdateMicUI();
+    if (fallContinuous && !fallIsLoading) setTimeout(fallStartMic, 500);
+  }
+}
+
 function fallFinishRec() {
   if (!fallIsRecording) return;
   clearTimeout(fallSilenceTimer); fallSilenceTimer = null;
   fallIsRecording = false; fallUpdateMicUI();
+  if (fallWebSpeechRec) { try { fallWebSpeechRec.abort(); } catch(e) {} fallWebSpeechRec = null; }
   if (fallMediaRecorder && fallMediaRecorder.state !== 'inactive') fallMediaRecorder.stop();
   if (fallAudioStream) { fallAudioStream.getTracks().forEach(t => t.stop()); fallAudioStream = null; }
 }
@@ -363,11 +541,19 @@ async function fallOnRecStop() {
   try {
     const resp = await fetch('/api/stt', {method: 'POST', headers: {'Content-Type': blob.type}, body: blob});
     const data = await resp.json();
+    if (data.error === 'stt_unavailable') {
+      // Server lost STT credits → switch permanently to Web Speech API
+      fallSttMode = 'webspeech';
+      document.getElementById('fall-text-input').value = '';
+      if (fallContinuous && !fallIsLoading) setTimeout(fallStartMic, 300);
+      return;
+    }
     const text = (data.text || '').trim();
     document.getElementById('fall-text-input').value = text;
     if (text) fallSend();
     else if (fallContinuous && !fallIsLoading) setTimeout(fallStartMic, 300);
   } catch (e) {
+    fallSttMode = 'webspeech';
     document.getElementById('fall-text-input').value = '';
     if (fallContinuous && !fallIsLoading) setTimeout(fallStartMic, 300);
   }
@@ -387,23 +573,41 @@ function fallUpdateMicUI() {
 }
 
 // ── Voice output ───────────────────────────────
+// Shared German voice selection — keep identical to ki_lehrer.html so both
+// features sound the same when falling back to Web Speech API.
+function fallPickGermanVoice() {
+  if (!window.speechSynthesis) return null;
+  const voices = speechSynthesis.getVoices();
+  const prefer = ['Anna', 'Helena', 'Petra', 'Katja', 'Hedda', 'Marlene'];
+  for (const name of prefer) {
+    const v = voices.find(v => v.lang.startsWith('de') && v.name.includes(name));
+    if (v) return v;
+  }
+  return voices.find(v => v.lang.startsWith('de') && !v.name.includes('Google'))
+      || voices.find(v => v.lang.startsWith('de'))
+      || null;
+}
+
 window.fallSpeakFallback = function(text) {
   if (!window.speechSynthesis) { if (fallContinuous) setTimeout(fallStartMic, 400); return; }
   window.speechSynthesis.cancel();
-  const utt = new SpeechSynthesisUtterance(text);
+  const utt = new SpeechSynthesisUtterance(fallNormalizeSpeechText(text));
   utt.lang = 'de-DE'; utt.rate = 0.92; utt.pitch = 1.05;
-  const voices = speechSynthesis.getVoices();
-  const de = voices.find(v => v.lang.startsWith('de') && !v.name.includes('Google'))
-          || voices.find(v => v.lang.startsWith('de'));
+  const de = fallPickGermanVoice();
   if (de) utt.voice = de;
   utt.onstart = () => fallSetSpeaking(true);
   utt.onend   = () => { fallSetSpeaking(false);
     if (fallContinuous && !fallIsLoading) setTimeout(fallStartMic, 400); };
   utt.onerror = () => { fallSetSpeaking(false);
+    if (!fallHasInteracted) fallPendingSpeech = fallNormalizeSpeechText(text);
     if (fallContinuous && !fallIsLoading) setTimeout(fallStartMic, 600); };
   speechSynthesis.speak(utt);
 };
-window.fallSpeak = window.fallSpeakFallback;
+window.fallSpeak = function(text) {
+  const normalized = fallNormalizeSpeechText(text);
+  if (!normalized) return;
+  fallPendingSpeech = normalized;
+};
 
 function fallSetSpeaking(on) {
   const wrap = document.getElementById('fall-avatar-wrap');
@@ -415,7 +619,10 @@ window.fallGetState = () => ({continuous: fallContinuous, loading: fallIsLoading
 
 if (window.speechSynthesis) {
   speechSynthesis.getVoices();
-  speechSynthesis.addEventListener('voiceschanged', () => speechSynthesis.getVoices());
+  speechSynthesis.addEventListener('voiceschanged', () => {
+    speechSynthesis.getVoices();
+    fallFlushPendingSpeech();
+  });
 }
 </script>
 
@@ -439,22 +646,46 @@ import { TalkingHead } from 'talkinghead';
     });
     if (fallback) fallback.style.display = 'none';
     window.fallResumeAudio = () => {
+      fallHasInteracted = true;
       if (head.audioCtx && head.audioCtx.state !== 'running') head.audioCtx.resume();
+      fallFlushPendingSpeech();
     };
+    // Eager resume attempt (works if the navigation click counted as a gesture)
+    try { if (head.audioCtx && head.audioCtx.state !== 'running') await head.audioCtx.resume(); } catch(e) {}
     window.fallSpeak = async function(text) {
       if (!text) return;
+      const normalized = fallNormalizeSpeechText(text);
+
       if (head.audioCtx && head.audioCtx.state !== 'running') {
-        try { await head.audioCtx.resume(); } catch(e) {}
+        try { await head.audioCtx.resume(); }
+        catch (e) {
+          fallPendingSpeech = normalized;
+          return;
+        }
+        if (head.audioCtx && head.audioCtx.state !== 'running') {
+          // Still suspended (no gesture yet) → keep queued for next interaction
+          fallPendingSpeech = normalized;
+          return;
+        }
       }
       window.fallSetSpeaking && window.fallSetSpeaking(true);
-      try { await head.speakText(text); }
-      catch (e) { window.fallSpeakFallback(text); return; }
+      try { await head.speakText(normalized); }
+      catch (e) {
+        console.warn('TalkingHead TTS error, falling back to Web Speech:', e);
+        window.fallSetSpeaking && window.fallSetSpeaking(false);
+        window.fallSpeakFallback(normalized);
+        return;
+      }
       window.fallSetSpeaking && window.fallSetSpeaking(false);
       const st = window.fallGetState && window.fallGetState();
       if (st && st.continuous && !st.loading) setTimeout(() => fallStartMic(), 400);
     };
+
+    fallFlushPendingSpeech();
   } catch (err) {
     console.warn('TalkingHead init failed; Web Speech fallback active', err);
+    window.fallSpeak = window.fallSpeakFallback;
+    fallFlushPendingSpeech();
   }
 })();
 window.fallSetSpeaking = (on) => {

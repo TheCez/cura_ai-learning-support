@@ -22,6 +22,12 @@
       <label for="kl-module-select">Modul:</label>
       <select id="kl-module-select" onchange="klOnModuleChange(this)">
         <option value="">– Modul wählen –</option>
+        <option value="mixed"
+                data-title="Gemischte Themen"
+                data-course="Alle Kurse"
+                data-level="{{ user.language_level }}">
+          🎲 Gemischte Themen (alle Module)
+        </option>
         {% for course in enrolled_courses %}
           <optgroup label="{{ course.title }}">
             {% for module in course.modules %}
@@ -158,6 +164,9 @@ let klIsLoading      = false;
 let klIsRecording    = false;
 let klAutoSpeak      = true;
 let klContinuousMode = false;
+let klPrefillQuestion = '';
+let klPendingSpeech  = '';
+let klHasInteracted  = false;
 
 // ── Slides ────────────────────────────────────
 let klSlides   = [];   // [{title, points, source}]
@@ -180,6 +189,7 @@ function klRenderSlide(animate) {
   const s = klSlides[klSlideIdx];
 
   const slideEl = document.getElementById('kl-ppt-slide');
+  slideEl.classList.remove('kl-slide-has-image');
   if (animate) {
     slideEl.classList.remove('kl-slide-in');
     void slideEl.offsetWidth;
@@ -245,6 +255,11 @@ async function klFetchWikipediaImage(title) {
   const terms = [title];
   title.split(/[\s,]+/).forEach(w => { if (w.length > 3) terms.push(w); });
 
+  const slideEl = document.getElementById('kl-ppt-slide');
+  const wrap = document.getElementById('kl-ppt-img-wrap');
+  slideEl.classList.remove('kl-slide-has-image');
+  wrap.style.display = 'none';
+
   for (const term of terms) {
     try {
       const url = 'https://de.wikipedia.org/api/rest_v1/page/summary/' + encodeURIComponent(term);
@@ -254,17 +269,59 @@ async function klFetchWikipediaImage(title) {
       const src  = data?.thumbnail?.source || data?.originalimage?.source;
       if (!src) continue;
       const img  = document.getElementById('kl-ppt-img');
-      const wrap = document.getElementById('kl-ppt-img-wrap');
-      img.onload  = () => { wrap.style.display = 'block'; };
-      img.onerror = () => { wrap.style.display = 'none';  };
+      img.onload  = () => {
+        wrap.style.display = 'block';
+        slideEl.classList.add('kl-slide-has-image');
+      };
+      img.onerror = () => {
+        wrap.style.display = 'none';
+        slideEl.classList.remove('kl-slide-has-image');
+      };
       img.src = src;
       return; // found one – stop
     } catch(e) { /* try next */ }
   }
+
+  slideEl.classList.remove('kl-slide-has-image');
+}
+
+// ── Audio unlock on user gesture ───────────────
+function klUnlockAudioFromGesture() {
+  klHasInteracted = true;
+  window.klResumeAudio && window.klResumeAudio();
+  klFlushPendingSpeech();
+}
+window.addEventListener('pointerdown', klUnlockAudioFromGesture, {passive: true});
+window.addEventListener('keydown', klUnlockAudioFromGesture);
+
+function klFlushPendingSpeech() {
+  if (!klPendingSpeech) return;
+  const text = klPendingSpeech;
+  klPendingSpeech = '';
+  klSpeak(text);
 }
 
 // ── Auto-welcome on page load ──────────────────
 window.addEventListener('DOMContentLoaded', () => {
+  const params = new URLSearchParams(window.location.search);
+  const requestedModuleId = params.get('module_id');
+  klPrefillQuestion = (params.get('frage') || '').trim();
+
+  const moduleSelect = document.getElementById('kl-module-select');
+  const requestedOption = requestedModuleId
+    ? moduleSelect.querySelector(`option[value="${requestedModuleId}"]`)
+    : null;
+
+  if (requestedOption) {
+    moduleSelect.value = requestedModuleId;
+    klOnModuleChange(moduleSelect);
+    return;
+  }
+
+  if (klPrefillQuestion) {
+    document.getElementById('kl-text-input').value = klPrefillQuestion;
+  }
+
   klShowLoadingBubble();
   fetch('/api/ki-lehrer', {
     method: 'POST',
@@ -277,8 +334,11 @@ window.addEventListener('DOMContentLoaded', () => {
     const text = data.response || 'Willkommen! Ich bin Prof. Wagner.';
     klConversation.push({role: 'model', text});
     klAddBubble('professor', text);
-    if (klAutoSpeak) klSpeak(text);
     document.getElementById('kl-placeholder').style.display = 'none';
+    if (klAutoSpeak) {
+      klPendingSpeech = text;
+      klSpeak(text);
+    }
   })
   .catch(() => {
     klRemoveLoadingBubble();
@@ -289,17 +349,18 @@ window.addEventListener('DOMContentLoaded', () => {
 
 // ── Modul auswählen ────────────────────────────
 function klOnModuleChange(select) {
+  klHasInteracted = true;
   window.klResumeAudio && window.klResumeAudio(); // unlock AudioContext on user gesture
   const opt = select.options[select.selectedIndex];
   if (!opt.value) return;
 
-  klModuleId     = parseInt(opt.value);
+  klModuleId     = (opt.value === 'mixed') ? 'mixed' : parseInt(opt.value);
   klConversation = [];
   // Reset slide stack for the new module session
   klSlides   = [];
   klSlideIdx = -1;
 
-  const mod    = window._klModules[String(klModuleId)] || {};
+  const mod    = (klModuleId !== 'mixed' && window._klModules[String(klModuleId)]) || {};
   const title  = mod.title  || opt.dataset.title  || '';
   const course = mod.course || opt.dataset.course || '';
   const level  = mod.level  || opt.dataset.level  || '';
@@ -335,8 +396,18 @@ function klOnModuleChange(select) {
     klAddBubble('professor', text);
     if (data.slide_title || (data.slide_points && data.slide_points.length))
       klSetSlide(data.slide_title, data.slide_points, data.slide_source || '');
-    if (klAutoSpeak) klSpeak(text);
+    if (klAutoSpeak) {
+      klPendingSpeech = text;
+      klSpeak(text);
+    }
     klSetInputEnabled(true);
+
+    if (klPrefillQuestion) {
+      const question = klPrefillQuestion;
+      klPrefillQuestion = '';
+      document.getElementById('kl-text-input').value = question;
+      klSend();
+    }
   })
   .catch(() => {
     klRemoveLoadingBubble();
@@ -632,15 +703,28 @@ function klUpdateMicUI() {
 }
 
 // ── Sprachausgabe ──────────────────────────────
+// Shared German voice selection — keep identical to fall_blutdruck.html so
+// both features sound the same when falling back to Web Speech API.
+function klPickGermanVoice() {
+  if (!window.speechSynthesis) return null;
+  const voices = speechSynthesis.getVoices();
+  const prefer = ['Anna', 'Helena', 'Petra', 'Katja', 'Hedda', 'Marlene'];
+  for (const name of prefer) {
+    const v = voices.find(v => v.lang.startsWith('de') && v.name.includes(name));
+    if (v) return v;
+  }
+  return voices.find(v => v.lang.startsWith('de') && !v.name.includes('Google'))
+      || voices.find(v => v.lang.startsWith('de'))
+      || null;
+}
+
 // Web Speech API fallback (active until TalkingHead overrides window.klSpeak)
 window.klSpeakFallback = function(text) {
   if (!window.speechSynthesis) { if (klContinuousMode) setTimeout(klStartMic, 400); return; }
   window.speechSynthesis.cancel();
   const utt = new SpeechSynthesisUtterance(text);
   utt.lang = 'de-DE'; utt.rate = 0.92; utt.pitch = 1.05;
-  const voices  = speechSynthesis.getVoices();
-  const deVoice = voices.find(v => v.lang.startsWith('de') && !v.name.includes('Google'))
-               || voices.find(v => v.lang.startsWith('de'));
+  const deVoice = klPickGermanVoice();
   if (deVoice) utt.voice = deVoice;
   utt.onstart = () => klSetSpeaking(true);
   utt.onend   = () => {
@@ -655,6 +739,8 @@ window.klSpeakFallback = function(text) {
 };
 // TalkingHead module overrides this via window.klSpeak once loaded
 function klSpeak(text) { window.klSpeakFallback(text); }
+// Expose for gesture flush
+window.klSpeak = klSpeak;
 // State getter for the ES module (let vars are not on window)
 window.klGetState = () => ({ continuousMode: klContinuousMode, isLoading: klIsLoading });
 function klSetSpeaking(on) {
@@ -721,6 +807,11 @@ import { TalkingHead } from 'talkinghead';
       // Ensure AudioContext is running before queuing audio
       if (head.audioCtx && head.audioCtx.state !== 'running') {
         try { await head.audioCtx.resume(); } catch(e) {}
+        // If still suspended (no user gesture yet), keep as pending and abort
+        if (head.audioCtx && head.audioCtx.state !== 'running') {
+          window.klPendingSpeechSet && window.klPendingSpeechSet(text);
+          return;
+        }
       }
       window.klSetSpeaking(true);
       try {
@@ -737,9 +828,20 @@ import { TalkingHead } from 'talkinghead';
       }
     };
 
+    // Try an eager resume (if the navigation click counted as a gesture)
+    try { if (head.audioCtx && head.audioCtx.state !== 'running') await head.audioCtx.resume(); } catch(e) {}
+
+    // If greeting speech is already queued, try to flush now
+    if (typeof klFlushPendingSpeech === 'function') klFlushPendingSpeech();
+
   } catch (err) {
     console.error('TalkingHead init failed, Web Speech API remains active:', err);
   }
 })();
+
+// Allow TalkingHead override to re-queue speech when audio context not yet unlocked
+window.klPendingSpeechSet = function(text) {
+  if (text) klPendingSpeech = text;
+};
 </script>
 {% endblock %}

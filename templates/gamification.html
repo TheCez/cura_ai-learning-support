@@ -76,19 +76,47 @@
 
     <div class="card gam-missions-card">
       <h2>🎮 Freunde-Missionen</h2>
-      {% if missions %}
+      {% if missions_active %}
         <ul class="missions-list">
-          {% for m in missions %}
+          {% for m in missions_active %}
             <li>
               <strong>{{ m.title }}</strong> ({{ m.target_xp }} XP)
               <br><small>
                 {% if m.creator_id == user.id %}Du hast diese Mission erstellt{% else %}Mission von einem Freund{% endif %}
+              </small>
+              <br><small>
+                Dein Fortschritt:
+                {% if m.creator_id == user.id %}
+                  {{ m.creator_xp or 0 }} / {{ m.target_xp }} XP
+                {% else %}
+                  {{ m.friend_xp or 0 }} / {{ m.target_xp }} XP
+                {% endif %}
+                · Partner:
+                {% if m.creator_id == user.id %}
+                  {{ m.friend_xp or 0 }} / {{ m.target_xp }} XP
+                {% else %}
+                  {{ m.creator_xp or 0 }} / {{ m.target_xp }} XP
+                {% endif %}
               </small>
             </li>
           {% endfor %}
         </ul>
       {% else %}
         <p>Keine aktiven Missionen.</p>
+      {% endif %}
+
+      <h3>✅ Abgeschlossene Missionen</h3>
+      {% if missions_completed %}
+        <ul class="missions-list">
+          {% for m in missions_completed %}
+            <li>
+              <strong>{{ m.title }}</strong> ({{ m.target_xp }} XP)
+              <br><small>Erfolgreich abgeschlossen.</small>
+            </li>
+          {% endfor %}
+        </ul>
+      {% else %}
+        <p>Noch keine abgeschlossenen Missionen.</p>
       {% endif %}
       {% if friends %}
       <details class="mission-creator">
